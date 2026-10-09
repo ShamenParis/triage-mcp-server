@@ -85,7 +85,5 @@ def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
 
 
 def main():
-    # Force the server to bind to 0.0.0.0 and the Databricks assigned port
-    # This prevents the 502 Bad Gateway error.
-    port = int(os.getenv("DATABRICKS_APP_PORT", 8000))
-    mcp.run(transport='sse', host="0.0.0.0", port=port)
+    # FastMCP v1 automatically binds to 0.0.0.0 and reads the Databricks port from the environment.
+    mcp.run(transport='sse')
