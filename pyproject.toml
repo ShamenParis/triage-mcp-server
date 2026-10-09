@@ -1,0 +1,10 @@
+[project]
+name = "custom-server"
+version = "0.1.0"
+dependencies = [
+    "mcp",
+    "databricks-sdk"
+]
+
+[project.scripts]
+custom-server = "custom_server.app:mcp.run"
