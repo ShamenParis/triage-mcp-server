@@ -8,7 +8,7 @@ from databricks.sdk import WorkspaceClient
 
 STATIC_DIR = Path(__file__).parent / "static"
 
-# Create an MCP server using the official Labs setup
+# Create an MCP server
 mcp = FastMCP("Triage MCP Server")
 w = WorkspaceClient()
 
@@ -82,31 +82,17 @@ def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
         return [{"error": f"Failed to retrieve logs: {str(e)}"}]
 
 
-# --- Databricks Labs FastAPI Setup ---
 mcp_app = mcp.streamable_http_app()
 
-fastapi_app = FastAPI(
+# This is what Uvicorn is looking for. It must be named 'app'.
+app = FastAPI(
     lifespan=lambda _: mcp.session_manager.run(),
 )
 
-@fastapi_app.get("/", include_in_schema=False)
+@app.get("/", include_in_schema=False)
 async def serve_index():
     if (STATIC_DIR / "index.html").exists():
         return FileResponse(STATIC_DIR / "index.html")
     return {"status": "Databricks Triage MCP Server is running."}
 
-fastapi_app.mount("/", mcp_app)
-
-# --- The Fix: Invisible Routing ---
-# This intercepts the Playground's /mcp request and hands it seamlessly to the /sse backend
-class MCPPathRewriteMiddleware:
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["path"].rstrip("/") == "/mcp":
-            scope = dict(scope)
-            scope["path"] = "/sse"
-        await self.app(scope, receive, send)
-
-# Uvicorn looks for 'app' to start the server
+app.mount("/", mcp_app)
