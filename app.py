@@ -1,13 +1,13 @@
 import re
 from typing import Dict, Any, List
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from databricks.sdk import WorkspaceClient
 
 # Initialize Databricks SDK
 w = WorkspaceClient()
 
-# Initialize FastMCP (This automatically handles FastAPI, SSE, and Uvicorn!)
-mcp = FastMCP("databricks-triage-mcp")
+# Initialize MCPServer (This is the MCP 2.x replacement for FastMCP)
+mcp = MCPServer("databricks-triage-mcp")
 
 # --- UTILITY FUNCTIONS ---
 def strip_ansi_codes(text: str) -> str:
@@ -83,6 +83,5 @@ def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
 
 
 if __name__ == "__main__":
-    # Databricks Apps require the app to listen on 0.0.0.0:8000
-    # FastMCP's .run() method dynamically spins up the ASGI server and SSE endpoints
+    # MCPServer dynamically spins up the ASGI server and SSE endpoints
     mcp.run(transport='sse', host="0.0.0.0", port=8000)
