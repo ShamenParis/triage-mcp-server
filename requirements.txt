@@ -1,4 +1,1 @@
-mcp<2
 databricks-sdk
-uvicorn
-starlette
