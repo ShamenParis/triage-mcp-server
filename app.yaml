@@ -1,1 +1,1 @@
-command: ["fastmcp", "run", "app.py:mcp"]
+command: ["python", "app.py"]
