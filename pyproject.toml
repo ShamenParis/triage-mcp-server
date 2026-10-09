@@ -12,4 +12,4 @@ dependencies = [
 ]
 
 [project.scripts]
-custom-server = "custom_server.app:mcp.run"
+custom-server = "custom_server.app:main"

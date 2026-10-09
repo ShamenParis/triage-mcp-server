@@ -1,9 +1,10 @@
+import os
 import re
 from typing import Dict, Any, List
 from databricks.sdk import WorkspaceClient
 from mcp.server.fastmcp import FastMCP
 
-# Create MCP server (FastMCP automatically configures the correct routes)
+# Create MCP server 
 mcp = FastMCP("Triage MCP Server")
 w = WorkspaceClient()
 
@@ -81,3 +82,10 @@ def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
         return failed_logs if failed_logs else [{"status": "No failed tasks found."}]
     except Exception as e:
         return [{"error": f"Failed to retrieve logs: {str(e)}"}]
+
+
+def main():
+    # Force the server to bind to 0.0.0.0 and the Databricks assigned port
+    # This prevents the 502 Bad Gateway error.
+    port = int(os.getenv("DATABRICKS_APP_PORT", 8000))
+    mcp.run(transport='sse', host="0.0.0.0", port=port)
