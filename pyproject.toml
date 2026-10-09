@@ -9,7 +9,7 @@ authors = [
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.12",
-    "mcp[cli]>=1.10.0",
+    "mcp[cli]<2",
     "uvicorn>=0.34.2",
     "databricks-sdk"
 ]
