@@ -52,7 +52,7 @@ def get_job_info(job_id: int, limit_runs: int = 5) -> Dict[str, Any]:
             
         return {"job_config": job_details, "recent_runs": recent_runs}
     except Exception as e:
-        return {"error": f"Failed to retrieve info for job_id {job_id}: {str(e)}"}]
+        return {"error": f"Failed to retrieve info for job_id {job_id}: {str(e)}"}
 
 @mcp.tool()
 def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
@@ -109,5 +109,4 @@ class MCPPathRewriteMiddleware:
             scope["path"] = "/sse"
         await self.app(scope, receive, send)
 
-# Uvicorn looks for 'app' to start the server, so we expose the wrapped version
-app = MCPPathRewriteMiddleware(fastapi_app)
+# Uvicorn looks for 'app' to start the server
