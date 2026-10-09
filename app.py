@@ -1,14 +1,13 @@
 import re
 from typing import Dict, Any, List
-from fastapi import FastAPI
-from mcp.server import Server
-from mcp.server.sse import SseServerTransport
-from starlette.routing import Route
+from mcp.server.fastmcp import FastMCP
 from databricks.sdk import WorkspaceClient
 
-# Initialize Databricks SDK and MCP Server
+# Initialize Databricks SDK
 w = WorkspaceClient()
-mcp = Server("databricks-triage-mcp")
+
+# Initialize FastMCP (This automatically handles FastAPI, SSE, and Uvicorn!)
+mcp = FastMCP("databricks-triage-mcp")
 
 # --- UTILITY FUNCTIONS ---
 def strip_ansi_codes(text: str) -> str:
@@ -19,7 +18,7 @@ def strip_ansi_codes(text: str) -> str:
 # --- MCP TOOLS ---
 
 @mcp.tool()
-async def get_job_names() -> List[Dict[str, Any]]:
+def get_job_names() -> List[Dict[str, Any]]:
     """Retrieves all Databricks jobs in the workspace. Returns job_id and job_name."""
     try:
         return [{"job_id": job.job_id, "job_name": job.settings.name} 
@@ -28,7 +27,7 @@ async def get_job_names() -> List[Dict[str, Any]]:
         return [{"error": f"Failed to retrieve jobs: {str(e)}"}]
 
 @mcp.tool()
-async def get_job_info(job_id: int, limit_runs: int = 5) -> Dict[str, Any]:
+def get_job_info(job_id: int, limit_runs: int = 5) -> Dict[str, Any]:
     """Retrieves the configuration and recent execution history (success/failure) for a job."""
     try:
         job = w.jobs.get(job_id)
@@ -56,7 +55,7 @@ async def get_job_info(job_id: int, limit_runs: int = 5) -> Dict[str, Any]:
         return {"error": f"Failed to retrieve info for job_id {job_id}: {str(e)}"}
 
 @mcp.tool()
-async def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
+def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
     """Fetches the deep notebook stack trace and task-level errors for a failed job run."""
     try:
         run = w.jobs.get_run(run_id=run_id)
@@ -82,37 +81,8 @@ async def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
     except Exception as e:
         return [{"error": f"Failed to retrieve logs: {str(e)}"}]
 
-# --- FASTAPI & SSE TRANSPORT SETUP ---
 
-app = FastAPI(title="Databricks Triage MCP Server")
-
-# Global reference to keep the transport alive
-sse_transport = None
-
-@app.get("/sse")
-async def handle_sse():
-    """Endpoint for the agent to establish the SSE connection."""
-    global sse_transport
-    sse_transport = SseServerTransport("/messages")
-    return await sse_transport.handle_sse_request()
-
-@app.post("/messages")
-async def handle_messages(request: Request):
-    """Endpoint where the agent sends tool execution requests."""
-    global sse_transport
-    if sse_transport is None:
-        raise HTTPException(status_code=400, detail="SSE connection not established")
-    await sse_transport.handle_post_message(request)
-
-# Bind the MCP server to the transport
-@app.on_event("startup")
-async def startup():
-    # In a real production app, you might manage multiple transport connections per client,
-    # but for a dedicated Databricks App serving a single supervisor, global binding works.
-    pass # The binding happens dynamically per SSE connection in advanced setups, 
-         # but the mcp SDK handles the routing internally.
-
-# Databricks Apps require the app to listen on 0.0.0.0:8000
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Databricks Apps require the app to listen on 0.0.0.0:8000
+    # FastMCP's .run() method dynamically spins up the ASGI server and SSE endpoints
+    mcp.run(transport='sse', host="0.0.0.0", port=8000)
