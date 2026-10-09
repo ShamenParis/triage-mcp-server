@@ -13,7 +13,6 @@ def strip_ansi_codes(text: str) -> str:
 def load_tools(mcp_server):
     """
     Registers the tools with the MCP server template provided by Databricks.
-    The description in the docstrings is automatically passed to the AI agent.
     """
 
     @mcp_server.tool
@@ -51,7 +50,8 @@ def load_tools(mcp_server):
                 
             return {"job_config": job_details, "recent_runs": recent_runs}
         except Exception as e:
-            return {"error": f"Failed to retrieve info for job_id {job_id}: {str(e)}"}]
+            # FIXED: Removed the stray ']' at the end of this line
+            return {"error": f"Failed to retrieve info for job_id {job_id}: {str(e)}"}
 
     @mcp_server.tool
     def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
