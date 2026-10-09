@@ -83,5 +83,4 @@ def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
 
 
 if __name__ == "__main__":
-    # MCPServer dynamically spins up the ASGI server and SSE endpoints
-    mcp.run(transport='sse', host="0.0.0.0", port=8000)
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)
