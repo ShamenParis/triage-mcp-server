@@ -1,34 +1,37 @@
 import re
 from typing import Dict, Any, List
-from mcp.server.mcpserver import MCPServer
 from databricks.sdk import WorkspaceClient
+from mcp.server.fastmcp import FastMCP
+
+# create MCP server
+mcp = FastMCP("Triage MCP Server")
 
 # Initialize Databricks SDK
 w = WorkspaceClient()
 
-# Initialize MCPServer (This is the MCP 2.x replacement for FastMCP)
-mcp = MCPServer("databricks-triage-mcp")
-
-# --- UTILITY FUNCTIONS ---
 def strip_ansi_codes(text: str) -> str:
     if not text: return ""
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     return ansi_escape.sub('', text)
 
-# --- MCP TOOLS ---
-
-@mcp.tool()
+# Tool 1
+@mcp.tool(
+    name="get_job_names",
+    description="Retrieves all Databricks jobs in the workspace. Returns job_id and job_name."
+)
 def get_job_names() -> List[Dict[str, Any]]:
-    """Retrieves all Databricks jobs in the workspace. Returns job_id and job_name."""
     try:
         return [{"job_id": job.job_id, "job_name": job.settings.name} 
                 for job in w.jobs.list() if job.settings and job.settings.name]
     except Exception as e:
         return [{"error": f"Failed to retrieve jobs: {str(e)}"}]
 
-@mcp.tool()
+# Tool 2
+@mcp.tool(
+    name="get_job_info",
+    description="Retrieves the configuration and recent execution history (success/failure) for a job."
+)
 def get_job_info(job_id: int, limit_runs: int = 5) -> Dict[str, Any]:
-    """Retrieves the configuration and recent execution history (success/failure) for a job."""
     try:
         job = w.jobs.get(job_id)
         job_details = {
@@ -54,9 +57,12 @@ def get_job_info(job_id: int, limit_runs: int = 5) -> Dict[str, Any]:
     except Exception as e:
         return {"error": f"Failed to retrieve info for job_id {job_id}: {str(e)}"}
 
-@mcp.tool()
+# Tool 3
+@mcp.tool(
+    name="get_run_error_logs",
+    description="Fetches the deep notebook stack trace and task-level errors for a failed job run."
+)
 def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
-    """Fetches the deep notebook stack trace and task-level errors for a failed job run."""
     try:
         run = w.jobs.get_run(run_id=run_id)
         failed_logs = []
@@ -80,8 +86,3 @@ def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
         return failed_logs if failed_logs else [{"status": "No failed tasks found."}]
     except Exception as e:
         return [{"error": f"Failed to retrieve logs: {str(e)}"}]
-
-
-if __name__ == "__main__":
-    # Tell the MCPServer to explicitly mount the SSE transport at the /mcp endpoint
-    mcp.run(transport='sse', host="0.0.0.0", port=8000, endpoint="/mcp")
