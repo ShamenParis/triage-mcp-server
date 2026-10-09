@@ -1,0 +1,4 @@
+name: "triage-mcp-server"
+compute:
+  # Smallest compute is fine since it's just routing API calls
+  instance_type: "basic"
