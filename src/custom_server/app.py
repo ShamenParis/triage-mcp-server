@@ -1,32 +1,39 @@
 import re
+import os
 import contextvars
 from typing import Dict, Any, List, Optional
 from mcp.server.fastmcp import FastMCP
 from databricks.sdk import WorkspaceClient
 
 # ---------------------------------------------------------------------------
-# Hybrid authentication: service principal + user-identity filtering
+# User-level OAuth authentication via Databricks Apps
 # ---------------------------------------------------------------------------
-# The Databricks Apps user-authorization OAuth token does not include a
-# "jobs" scope, so the forwarded user token cannot call the Jobs API
-# directly.  Instead, we use the app's service principal for all Jobs API
-# calls and filter results by the calling user's email (forwarded in the
-# X-Forwarded-Email header).  This gives each user a personalized view of
-# only the jobs they own, without requiring the jobs OAuth scope.
+# Databricks Apps forwards the calling user's OAuth access token in the
+# X-Forwarded-Access-Token header.  We create a per-request WorkspaceClient
+# with that token so every API call runs as the user and respects the
+# user's own permissions — no service-principal job grants needed.
 #
-# When X-Forwarded-Email is absent (e.g. local dev), no filtering is applied
-# and all jobs the service principal can see are returned.
+# When the forwarded token is absent (e.g. local dev), falls back to
+# default WorkspaceClient() auth (PAT, SP, or CLI profile).
+_user_token: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_user_token", default=None
+)
+
 _user_email: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_user_email", default=None
 )
 
-_default_client = WorkspaceClient()
-
 
 def _get_workspace_client() -> WorkspaceClient:
-    """Return the service-principal WorkspaceClient for API calls.
-    Per-user filtering is applied at the tool level using _user_email."""
-    return _default_client
+    """Return a WorkspaceClient authenticated as the calling user when
+    running in Databricks Apps, or default auth for local dev."""
+    token = _user_token.get()
+    if token:
+        return WorkspaceClient(
+            host=os.environ.get("DATABRICKS_HOST", ""),
+            token=token,
+        )
+    return WorkspaceClient()
 
 
 def _get_user_email() -> Optional[str]:
@@ -35,25 +42,31 @@ def _get_user_email() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# ASGI middleware: extract X-Forwarded-Email set by Databricks Apps
-# and populate the _user_email ContextVar so tools can filter by owner.
-# Uses raw ASGI wrapping (not BaseHTTPMiddleware) to stay safe with
-# the streaming / SSE responses that MCP relies on.
+# ASGI middleware: extract X-Forwarded-Access-Token and X-Forwarded-Email
+# set by Databricks Apps and populate ContextVars for per-request auth.
+# Uses raw ASGI wrapping (safe with MCP's streaming/SSE responses).
 # ---------------------------------------------------------------------------
-class _UserEmailMiddleware:
+class _UserAuthMiddleware:
     def __init__(self, asgi_app):
         self.app = asgi_app
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             headers = dict(scope.get("headers", []))
-            raw = headers.get(b"x-forwarded-email")
-            email = raw.decode("utf-8") if raw else None
-            token = _user_email.set(email)
+
+            raw_token = headers.get(b"x-forwarded-access-token")
+            access_token = raw_token.decode("utf-8") if raw_token else None
+            token_cv = _user_token.set(access_token)
+
+            raw_email = headers.get(b"x-forwarded-email")
+            email = raw_email.decode("utf-8") if raw_email else None
+            email_cv = _user_email.set(email)
+
             try:
                 await self.app(scope, receive, send)
             finally:
-                _user_email.reset(token)
+                _user_token.reset(token_cv)
+                _user_email.reset(email_cv)
         else:
             await self.app(scope, receive, send)
 
@@ -82,6 +95,7 @@ def debug_info() -> Dict[str, Any]:
                 break
         return {
             "user_email": user_email,
+            "has_user_token": _user_token.get() is not None,
             "job_count_sample": job_count,
             "sample_creator": sample_creator,
             "host": w.config.host,
@@ -96,24 +110,16 @@ def strip_ansi_codes(text: str) -> str:
 
 @mcp.tool()
 def get_job_names() -> List[Dict[str, Any]]:
-    """Retrieves all Databricks jobs the calling user has access to (filtered by owner).
-    Returns job_id and job_name. In local dev (no forwarded user), returns all jobs."""
+    """Retrieve all Databricks jobs available in the workspace for the user."""
     try:
         w = _get_workspace_client()
-        user_email = _get_user_email()
         jobs = []
         for job in w.jobs.list():
             if not job.settings or not job.settings.name:
                 continue
-            # Filter by owner when running inside Databricks Apps
-            if user_email:
-                creator = getattr(job, 'creator_user_name', None) or ''
-                if creator != user_email:
-                    continue
             jobs.append({"job_id": job.job_id, "job_name": job.settings.name})
         if not jobs:
-            return [{"message": f"No jobs found. user_email={user_email}, host={w.config.host}. "
-                      "Ensure the app service principal has CAN_VIEW permission on jobs."}]
+            return [{"message": "No jobs found. Check your permissions or verify the workspace."}]
         return jobs
     except Exception as e:
         return [{"error": f"Failed to retrieve jobs: {str(e)}"}]
@@ -123,13 +129,7 @@ def get_job_info(job_id: int, limit_runs: int = 5) -> Dict[str, Any]:
     """Retrieves the configuration and recent execution history (success/failure) for a job."""
     try:
         w = _get_workspace_client()
-        user_email = _get_user_email()
         job = w.jobs.get(job_id)
-        # Verify ownership when running inside Databricks Apps
-        if user_email:
-            creator = getattr(job, 'creator_user_name', None) or ''
-            if creator != user_email:
-                return {"error": f"Access denied: job {job_id} is not owned by {user_email}"}
         job_details = {
             "job_id": job.job_id,
             "job_name": job.settings.name if job.settings else "Unknown",
@@ -159,12 +159,6 @@ def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
     try:
         w = _get_workspace_client()
         run = w.jobs.get_run(run_id=run_id)
-        # Verify ownership when running inside Databricks Apps
-        user_email = _get_user_email()
-        if user_email:
-            creator = getattr(run, 'creator_user_name', None) or ''
-            if creator != user_email:
-                return [{"error": f"Access denied: run {run_id} is not owned by {user_email}"}]
         failed_logs = []
         tasks = run.tasks if getattr(run, 'tasks', None) else [run]
         
@@ -193,4 +187,4 @@ def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
 # and the /mcp endpoint internally.
 # Wrap the MCP app with middleware that populates _user_email from headers
 _mcp_app = mcp.streamable_http_app()
-app = _UserEmailMiddleware(_mcp_app)
+app = _UserAuthMiddleware(_mcp_app)
