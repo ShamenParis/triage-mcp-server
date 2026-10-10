@@ -1,13 +1,8 @@
-from pathlib import Path
 import re
 import contextvars
 from typing import Dict, Any, List, Optional
 from mcp.server.fastmcp import FastMCP
-from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse
 from databricks.sdk import WorkspaceClient
-
-STATIC_DIR = Path(__file__).parent / "static"
 
 # ---------------------------------------------------------------------------
 # Hybrid authentication: service principal + user-identity filtering
@@ -166,33 +161,7 @@ def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
         return [{"error": f"Failed to retrieve logs: {str(e)}"}]
 
 
-mcp_app = mcp.streamable_http_app()
-
-# This is what Uvicorn is looking for. It must be named 'app'.
-app = FastAPI(
-    lifespan=lambda _: mcp.session_manager.run(),
-)
-
-
-@app.middleware("http")
-async def capture_user_token(request: Request, call_next):
-    """Extract the calling user's email from the X-Forwarded-Email header
-    forwarded by Databricks Apps and store it in a ContextVar for the request
-    lifetime.  Used for filtering jobs by owner."""
-    email = request.headers.get("x-forwarded-email")
-    email_set = _user_email.set(email) if email else None
-    try:
-        return await call_next(request)
-    finally:
-        if email_set is not None:
-            _user_email.reset(email_set)
-
-@app.get("/", include_in_schema=False)
-async def serve_index():
-    if (STATIC_DIR / "index.html").exists():
-        return FileResponse(STATIC_DIR / "index.html")
-    return {"status": "Databricks Triage MCP Server is running."}
-
-# Mount the MCP app AFTER defining middleware so the middleware applies
-# to the mounted sub-application as well.
-app.mount("/", mcp_app)
+# Use the MCP streamable HTTP app directly as the ASGI app.
+# The streamable_http_app() handles session management, routing,
+# and the /mcp endpoint internally.
+app = mcp.streamable_http_app()
