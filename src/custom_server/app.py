@@ -1,43 +1,35 @@
 import re
 import os
 import contextvars
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from mcp.server.fastmcp import FastMCP
 from databricks.sdk import WorkspaceClient
 
 # ---------------------------------------------------------------------------
-# User-level OAuth authentication via Databricks Apps
+# Hybrid auth: SP (workspace admin) + per-user permission enforcement
 # ---------------------------------------------------------------------------
-# Databricks Apps forwards the calling user's OAuth access token in the
-# X-Forwarded-Access-Token header.  We create a per-request WorkspaceClient
-# with that token so every API call runs as the user and respects the
-# user's own permissions — no service-principal job grants needed.
+# The "jobs" scope is NOT supported by Databricks Apps user OAuth tokens.
+# Therefore we use the app's service principal (must be workspace admin)
+# for all Jobs API calls, then filter results using the Permissions API
+# to enforce each user's actual job-level access.
 #
-# When the forwarded token is absent (e.g. local dev), falls back to
-# default WorkspaceClient() auth (PAT, SP, or CLI profile).
-_user_token: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "_user_token", default=None
-)
-
+# Flow:  SP lists all jobs  →  Permissions API checks each job's ACL
+#        against the calling user's email & group memberships  →  only
+#        permitted jobs are returned.
+#
+# When X-Forwarded-Email is absent (e.g. local dev), no filtering is
+# applied and all jobs the service principal can see are returned.
 _user_email: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_user_email", default=None
 )
 
+_sp_client = WorkspaceClient()  # uses DATABRICKS_CLIENT_ID / SECRET from env
+
 
 def _get_workspace_client() -> WorkspaceClient:
-    """Return a WorkspaceClient authenticated as the calling user when
-    running in Databricks Apps, or default auth for local dev."""
-    token = _user_token.get()
-    if token:
-        # Force auth_type="pat" so the SDK uses ONLY the forwarded user
-        # token and ignores the SP's DATABRICKS_CLIENT_ID / CLIENT_SECRET
-        # env vars that Databricks Apps sets automatically.
-        return WorkspaceClient(
-            host=os.environ.get("DATABRICKS_HOST", ""),
-            token=token,
-            auth_type="pat",
-        )
-    return WorkspaceClient()
+    """Return the service-principal WorkspaceClient for Jobs API calls."""
+    return _sp_client
 
 
 def _get_user_email() -> Optional[str]:
@@ -45,9 +37,43 @@ def _get_user_email() -> Optional[str]:
     return _user_email.get()
 
 
+def _get_user_identity(w: WorkspaceClient) -> tuple:
+    """Resolve the calling user's email, group memberships, and admin status.
+    Returns (email, groups, is_admin).  When no user context (local dev),
+    returns (None, set(), True) so all jobs are visible."""
+    email = _get_user_email()
+    if not email:
+        return None, set(), True  # local dev — no restrictions
+    try:
+        users = list(w.users.list(filter=f'userName eq "{email}"'))
+        if not users:
+            return email, set(), False
+        groups: Set[str] = {g.display for g in (users[0].groups or []) if g.display}
+        is_admin = "admins" in groups
+        return email, groups, is_admin
+    except Exception:
+        return email, set(), False
+
+
+def _user_can_view_job(
+    w: WorkspaceClient, job_id: int, user_email: str, user_groups: Set[str]
+) -> bool:
+    """Check if a user has at least CAN_VIEW on a job (directly or via group)."""
+    try:
+        perms = w.permissions.get("jobs", str(job_id))
+        for acl in perms.access_control_list or []:
+            if acl.user_name and acl.user_name.lower() == user_email.lower():
+                return True
+            if acl.group_name and acl.group_name in user_groups:
+                return True
+        return False
+    except Exception:
+        return False  # deny on error
+
+
 # ---------------------------------------------------------------------------
-# ASGI middleware: extract X-Forwarded-Access-Token and X-Forwarded-Email
-# set by Databricks Apps and populate ContextVars for per-request auth.
+# ASGI middleware: extract X-Forwarded-Email set by Databricks Apps
+# and populate the _user_email ContextVar so tools can filter by owner.
 # Uses raw ASGI wrapping (safe with MCP's streaming/SSE responses).
 # ---------------------------------------------------------------------------
 class _UserAuthMiddleware:
@@ -58,10 +84,6 @@ class _UserAuthMiddleware:
         if scope["type"] == "http":
             headers = dict(scope.get("headers", []))
 
-            raw_token = headers.get(b"x-forwarded-access-token")
-            access_token = raw_token.decode("utf-8") if raw_token else None
-            token_cv = _user_token.set(access_token)
-
             raw_email = headers.get(b"x-forwarded-email")
             email = raw_email.decode("utf-8") if raw_email else None
             email_cv = _user_email.set(email)
@@ -69,7 +91,6 @@ class _UserAuthMiddleware:
             try:
                 await self.app(scope, receive, send)
             finally:
-                _user_token.reset(token_cv)
                 _user_email.reset(email_cv)
         else:
             await self.app(scope, receive, send)
@@ -99,7 +120,7 @@ def debug_info() -> Dict[str, Any]:
                 break
         return {
             "user_email": user_email,
-            "has_user_token": _user_token.get() is not None,
+            "auth_mode": "service_principal",
             "job_count_sample": job_count,
             "sample_creator": sample_creator,
             "host": w.config.host,
@@ -114,17 +135,40 @@ def strip_ansi_codes(text: str) -> str:
 
 @mcp.tool()
 def get_job_names() -> List[Dict[str, Any]]:
-    """Retrieve all Databricks jobs available in the workspace for the user."""
+    """Retrieve Databricks jobs the calling user has permission to view."""
     try:
         w = _get_workspace_client()
-        jobs = []
+        email, groups, is_admin = _get_user_identity(w)
+
+        # Collect all jobs via SP (workspace admin)
+        all_jobs = []
         for job in w.jobs.list():
             if not job.settings or not job.settings.name:
                 continue
-            jobs.append({"job_id": job.job_id, "job_name": job.settings.name})
-        if not jobs:
-            return [{"message": "No jobs found. Check your permissions or verify the workspace."}]
-        return jobs
+            all_jobs.append({
+                "job_id": job.job_id,
+                "job_name": job.settings.name,
+                "creator": getattr(job, 'creator_user_name', None),
+            })
+
+        if not all_jobs:
+            return [{"message": "No jobs found in workspace."}]
+
+        # Admin or local dev — return all jobs
+        if is_admin:
+            return sorted(all_jobs, key=lambda j: j["job_name"])
+
+        # Non-admin — filter by per-job permissions (parallel checks)
+        def check(job):
+            return _user_can_view_job(w, job["job_id"], email, groups)
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(check, j): j for j in all_jobs}
+            allowed = [futures[f] for f in as_completed(futures) if f.result()]
+
+        if not allowed:
+            return [{"message": f"No jobs found that {email} has permission to view."}]
+        return sorted(allowed, key=lambda j: j["job_name"])
     except Exception as e:
         return [{"error": f"Failed to retrieve jobs: {str(e)}"}]
 
@@ -133,6 +177,11 @@ def get_job_info(job_id: int, limit_runs: int = 5) -> Dict[str, Any]:
     """Retrieves the configuration and recent execution history (success/failure) for a job."""
     try:
         w = _get_workspace_client()
+        # Permission check
+        email, groups, is_admin = _get_user_identity(w)
+        if not is_admin and email:
+            if not _user_can_view_job(w, job_id, email, groups):
+                return {"error": f"Access denied: {email} does not have permission to view job {job_id}."}
         job = w.jobs.get(job_id)
         job_details = {
             "job_id": job.job_id,
@@ -163,6 +212,12 @@ def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
     try:
         w = _get_workspace_client()
         run = w.jobs.get_run(run_id=run_id)
+        # Permission check on the parent job
+        email, groups, is_admin = _get_user_identity(w)
+        job_id = getattr(run, 'job_id', None)
+        if not is_admin and email and job_id:
+            if not _user_can_view_job(w, job_id, email, groups):
+                return [{"error": f"Access denied: {email} does not have permission to view job {job_id}."}]
         failed_logs = []
         tasks = run.tasks if getattr(run, 'tasks', None) else [run]
         
