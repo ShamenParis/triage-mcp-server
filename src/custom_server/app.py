@@ -34,6 +34,30 @@ def _get_user_email() -> Optional[str]:
     return _user_email.get()
 
 
+# ---------------------------------------------------------------------------
+# ASGI middleware: extract X-Forwarded-Email set by Databricks Apps
+# and populate the _user_email ContextVar so tools can filter by owner.
+# Uses raw ASGI wrapping (not BaseHTTPMiddleware) to stay safe with
+# the streaming / SSE responses that MCP relies on.
+# ---------------------------------------------------------------------------
+class _UserEmailMiddleware:
+    def __init__(self, asgi_app):
+        self.app = asgi_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers", []))
+            raw = headers.get(b"x-forwarded-email")
+            email = raw.decode("utf-8") if raw else None
+            token = _user_email.set(email)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                _user_email.reset(token)
+        else:
+            await self.app(scope, receive, send)
+
+
 # Create an MCP server
 mcp = FastMCP("Triage MCP Server")
 
@@ -87,6 +111,9 @@ def get_job_names() -> List[Dict[str, Any]]:
                 if creator != user_email:
                     continue
             jobs.append({"job_id": job.job_id, "job_name": job.settings.name})
+        if not jobs:
+            return [{"message": f"No jobs found. user_email={user_email}, host={w.config.host}. "
+                      "Ensure the app service principal has CAN_VIEW permission on jobs."}]
         return jobs
     except Exception as e:
         return [{"error": f"Failed to retrieve jobs: {str(e)}"}]
@@ -164,4 +191,6 @@ def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
 # Use the MCP streamable HTTP app directly as the ASGI app.
 # The streamable_http_app() handles session management, routing,
 # and the /mcp endpoint internally.
-app = mcp.streamable_http_app()
+# Wrap the MCP app with middleware that populates _user_email from headers
+_mcp_app = mcp.streamable_http_app()
+app = _UserEmailMiddleware(_mcp_app)
