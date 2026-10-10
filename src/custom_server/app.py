@@ -60,8 +60,8 @@ def get_job_names() -> List[Dict[str, Any]]:
                 continue
             # Filter by owner when running inside Databricks Apps
             if user_email:
-                owner = getattr(job, 'owner', None) or ''
-                if owner != user_email:
+                creator = getattr(job, 'creator_user_name', None) or ''
+                if creator != user_email:
                     continue
             jobs.append({"job_id": job.job_id, "job_name": job.settings.name})
         return jobs
@@ -77,8 +77,8 @@ def get_job_info(job_id: int, limit_runs: int = 5) -> Dict[str, Any]:
         job = w.jobs.get(job_id)
         # Verify ownership when running inside Databricks Apps
         if user_email:
-            owner = getattr(job, 'owner', None) or ''
-            if owner != user_email:
+            creator = getattr(job, 'creator_user_name', None) or ''
+            if creator != user_email:
                 return {"error": f"Access denied: job {job_id} is not owned by {user_email}"}
         job_details = {
             "job_id": job.job_id,
@@ -112,8 +112,8 @@ def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
         # Verify ownership when running inside Databricks Apps
         user_email = _get_user_email()
         if user_email:
-            owner = getattr(run, 'owner', None) or ''
-            if owner != user_email:
+            creator = getattr(run, 'creator_user_name', None) or ''
+            if creator != user_email:
                 return [{"error": f"Access denied: run {run_id} is not owned by {user_email}"}]
         failed_logs = []
         tasks = run.tasks if getattr(run, 'tasks', None) else [run]
