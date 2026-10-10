@@ -29,9 +29,13 @@ def _get_workspace_client() -> WorkspaceClient:
     running in Databricks Apps, or default auth for local dev."""
     token = _user_token.get()
     if token:
+        # Force auth_type="pat" so the SDK uses ONLY the forwarded user
+        # token and ignores the SP's DATABRICKS_CLIENT_ID / CLIENT_SECRET
+        # env vars that Databricks Apps sets automatically.
         return WorkspaceClient(
             host=os.environ.get("DATABRICKS_HOST", ""),
             token=token,
+            auth_type="pat",
         )
     return WorkspaceClient()
 
