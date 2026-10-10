@@ -31,7 +31,16 @@ def _get_workspace_client() -> WorkspaceClient:
     app's service principal if no user token is present."""
     token = _user_token.get()
     if token:
-        cfg = Config(host=_default_client.config.host, token=token)
+        # Explicitly clear client_id/client_secret to override the OAuth M2M
+        # env vars (DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET) that
+        # Databricks Apps injects for the app's service principal. Without
+        # this, the SDK sees both OAuth and PAT and rejects the config.
+        cfg = Config(
+            host=_default_client.config.host,
+            token=token,
+            client_id="",
+            client_secret="",
+        )
         return WorkspaceClient(config=cfg)
     return _default_client
 
