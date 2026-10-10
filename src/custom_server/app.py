@@ -1,16 +1,43 @@
 from pathlib import Path
 import re
+import contextvars
 from typing import Dict, Any, List
 from mcp.server.fastmcp import FastMCP
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.core import Config
 
 STATIC_DIR = Path(__file__).parent / "static"
 
+# ---------------------------------------------------------------------------
+# Per-user authentication
+# ---------------------------------------------------------------------------
+# Databricks Apps forward the calling user's OAuth access token in the
+# x-forwarded-access-token HTTP header.  We capture it per-request via a
+# ContextVar and build a WorkspaceClient that authenticates as that user,
+# so Databricks enforces the user's own permissions (job visibility, run
+# access, etc.).  When the header is absent (e.g. local dev), we fall back
+# to the app's service principal.
+_user_token: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_user_token", default=None
+)
+
+_default_client = WorkspaceClient()
+
+
+def _get_workspace_client() -> WorkspaceClient:
+    """Return a WorkspaceClient authenticated as the calling user, or the
+    app's service principal if no user token is present."""
+    token = _user_token.get()
+    if token:
+        cfg = Config(host=_default_client.config.host, token=token)
+        return WorkspaceClient(config=cfg)
+    return _default_client
+
+
 # Create an MCP server
 mcp = FastMCP("Triage MCP Server")
-w = WorkspaceClient()
 
 def strip_ansi_codes(text: str) -> str:
     if not text: return ""
@@ -21,6 +48,7 @@ def strip_ansi_codes(text: str) -> str:
 def get_job_names() -> List[Dict[str, Any]]:
     """Retrieves all Databricks jobs in the workspace. Returns job_id and job_name."""
     try:
+        w = _get_workspace_client()
         return [{"job_id": job.job_id, "job_name": job.settings.name} 
                 for job in w.jobs.list() if job.settings and job.settings.name]
     except Exception as e:
@@ -30,6 +58,7 @@ def get_job_names() -> List[Dict[str, Any]]:
 def get_job_info(job_id: int, limit_runs: int = 5) -> Dict[str, Any]:
     """Retrieves the configuration and recent execution history (success/failure) for a job."""
     try:
+        w = _get_workspace_client()
         job = w.jobs.get(job_id)
         job_details = {
             "job_id": job.job_id,
@@ -58,6 +87,7 @@ def get_job_info(job_id: int, limit_runs: int = 5) -> Dict[str, Any]:
 def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
     """Fetches the deep notebook stack trace and task-level errors for a failed job run."""
     try:
+        w = _get_workspace_client()
         run = w.jobs.get_run(run_id=run_id)
         failed_logs = []
         tasks = run.tasks if getattr(run, 'tasks', None) else [run]
@@ -89,10 +119,25 @@ app = FastAPI(
     lifespan=lambda _: mcp.session_manager.run(),
 )
 
+
+@app.middleware("http")
+async def capture_user_token(request: Request, call_next):
+    """Extract the calling user's access token from the header forwarded by
+    Databricks Apps and store it in a ContextVar for the request lifetime."""
+    token = request.headers.get("x-forwarded-access-token")
+    token_set = _user_token.set(token) if token else None
+    try:
+        return await call_next(request)
+    finally:
+        if token_set is not None:
+            _user_token.reset(token_set)
+
 @app.get("/", include_in_schema=False)
 async def serve_index():
     if (STATIC_DIR / "index.html").exists():
         return FileResponse(STATIC_DIR / "index.html")
     return {"status": "Databricks Triage MCP Server is running."}
 
+# Mount the MCP app AFTER defining middleware so the middleware applies
+# to the mounted sub-application as well.
 app.mount("/", mcp_app)
