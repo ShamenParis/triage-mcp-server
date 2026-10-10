@@ -42,6 +42,34 @@ def _get_user_email() -> Optional[str]:
 # Create an MCP server
 mcp = FastMCP("Triage MCP Server")
 
+@mcp.tool()
+def health() -> str:
+    """Health check. Returns 'ok' if the server is running."""
+    return "ok"
+
+@mcp.tool()
+def debug_info() -> Dict[str, Any]:
+    """Returns diagnostic info: forwarded user email and a sample job count."""
+    try:
+        w = _get_workspace_client()
+        user_email = _get_user_email()
+        job_count = 0
+        sample_creator = None
+        for job in w.jobs.list():
+            job_count += 1
+            if sample_creator is None:
+                sample_creator = getattr(job, 'creator_user_name', None)
+            if job_count >= 5:
+                break
+        return {
+            "user_email": user_email,
+            "job_count_sample": job_count,
+            "sample_creator": sample_creator,
+            "host": w.config.host,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 def strip_ansi_codes(text: str) -> str:
     if not text: return ""
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
