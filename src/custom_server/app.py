@@ -1,49 +1,42 @@
 from pathlib import Path
 import re
 import contextvars
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from mcp.server.fastmcp import FastMCP
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.core import Config
 
 STATIC_DIR = Path(__file__).parent / "static"
 
 # ---------------------------------------------------------------------------
-# Per-user authentication
+# Hybrid authentication: service principal + user-identity filtering
 # ---------------------------------------------------------------------------
-# Databricks Apps forward the calling user's OAuth access token in the
-# x-forwarded-access-token HTTP header.  We capture it per-request via a
-# ContextVar and build a WorkspaceClient that authenticates as that user,
-# so Databricks enforces the user's own permissions (job visibility, run
-# access, etc.).  When the header is absent (e.g. local dev), we fall back
-# to the app's service principal.
-_user_token: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "_user_token", default=None
+# The Databricks Apps user-authorization OAuth token does not include a
+# "jobs" scope, so the forwarded user token cannot call the Jobs API
+# directly.  Instead, we use the app's service principal for all Jobs API
+# calls and filter results by the calling user's email (forwarded in the
+# X-Forwarded-Email header).  This gives each user a personalized view of
+# only the jobs they own, without requiring the jobs OAuth scope.
+#
+# When X-Forwarded-Email is absent (e.g. local dev), no filtering is applied
+# and all jobs the service principal can see are returned.
+_user_email: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_user_email", default=None
 )
 
 _default_client = WorkspaceClient()
 
 
 def _get_workspace_client() -> WorkspaceClient:
-    """Return a WorkspaceClient authenticated as the calling user, or the
-    app's service principal if no user token is present."""
-    token = _user_token.get()
-    if token:
-        # auth_type="pat" tells the SDK to prefer PAT auth. This bypasses the
-        # _validate() check that rejects configs with multiple auth methods
-        # (the Databricks Apps env has DATABRICKS_CLIENT_ID/CLIENT_SECRET for
-        # the service principal, which the SDK would otherwise detect as OAuth).
-        # DefaultCredentials.__call__ also skips non-matching providers when
-        # auth_type is explicitly set, so only pat_auth is attempted.
-        cfg = Config(
-            host=_default_client.config.host,
-            token=token,
-            auth_type="pat",
-        )
-        return WorkspaceClient(config=cfg)
+    """Return the service-principal WorkspaceClient for API calls.
+    Per-user filtering is applied at the tool level using _user_email."""
     return _default_client
+
+
+def _get_user_email() -> Optional[str]:
+    """Return the calling user's email from the forwarded header, or None."""
+    return _user_email.get()
 
 
 # Create an MCP server
@@ -56,11 +49,22 @@ def strip_ansi_codes(text: str) -> str:
 
 @mcp.tool()
 def get_job_names() -> List[Dict[str, Any]]:
-    """Retrieves all Databricks jobs in the workspace. Returns job_id and job_name."""
+    """Retrieves all Databricks jobs the calling user has access to (filtered by owner).
+    Returns job_id and job_name. In local dev (no forwarded user), returns all jobs."""
     try:
         w = _get_workspace_client()
-        return [{"job_id": job.job_id, "job_name": job.settings.name} 
-                for job in w.jobs.list() if job.settings and job.settings.name]
+        user_email = _get_user_email()
+        jobs = []
+        for job in w.jobs.list():
+            if not job.settings or not job.settings.name:
+                continue
+            # Filter by owner when running inside Databricks Apps
+            if user_email:
+                owner = getattr(job, 'owner', None) or ''
+                if owner != user_email:
+                    continue
+            jobs.append({"job_id": job.job_id, "job_name": job.settings.name})
+        return jobs
     except Exception as e:
         return [{"error": f"Failed to retrieve jobs: {str(e)}"}]
 
@@ -69,7 +73,13 @@ def get_job_info(job_id: int, limit_runs: int = 5) -> Dict[str, Any]:
     """Retrieves the configuration and recent execution history (success/failure) for a job."""
     try:
         w = _get_workspace_client()
+        user_email = _get_user_email()
         job = w.jobs.get(job_id)
+        # Verify ownership when running inside Databricks Apps
+        if user_email:
+            owner = getattr(job, 'owner', None) or ''
+            if owner != user_email:
+                return {"error": f"Access denied: job {job_id} is not owned by {user_email}"}
         job_details = {
             "job_id": job.job_id,
             "job_name": job.settings.name if job.settings else "Unknown",
@@ -99,6 +109,12 @@ def get_run_error_logs(run_id: int) -> List[Dict[str, Any]]:
     try:
         w = _get_workspace_client()
         run = w.jobs.get_run(run_id=run_id)
+        # Verify ownership when running inside Databricks Apps
+        user_email = _get_user_email()
+        if user_email:
+            owner = getattr(run, 'owner', None) or ''
+            if owner != user_email:
+                return [{"error": f"Access denied: run {run_id} is not owned by {user_email}"}]
         failed_logs = []
         tasks = run.tasks if getattr(run, 'tasks', None) else [run]
         
@@ -132,15 +148,16 @@ app = FastAPI(
 
 @app.middleware("http")
 async def capture_user_token(request: Request, call_next):
-    """Extract the calling user's access token from the header forwarded by
-    Databricks Apps and store it in a ContextVar for the request lifetime."""
-    token = request.headers.get("x-forwarded-access-token")
-    token_set = _user_token.set(token) if token else None
+    """Extract the calling user's email from the X-Forwarded-Email header
+    forwarded by Databricks Apps and store it in a ContextVar for the request
+    lifetime.  Used for filtering jobs by owner."""
+    email = request.headers.get("x-forwarded-email")
+    email_set = _user_email.set(email) if email else None
     try:
         return await call_next(request)
     finally:
-        if token_set is not None:
-            _user_token.reset(token_set)
+        if email_set is not None:
+            _user_email.reset(email_set)
 
 @app.get("/", include_in_schema=False)
 async def serve_index():
